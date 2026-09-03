@@ -824,4 +824,153 @@ mod tests {
         assert_eq!(scaled.width, i32::MAX);
         assert_eq!(scaled.height, i32::MIN);
     }
+
+    mod properties {
+        use super::*;
+        use hegel::generators;
+
+        /// Property: `scale_extents` agrees with the same corner arithmetic
+        /// done in `f64`, and saturates at the `i32` bounds instead of
+        /// wrapping.
+        ///
+        /// `full_range_extents_saturate` above asserts the saturation for the
+        /// identity scale. The scale factor is whatever the caller passed to
+        /// `ShapeOptions::scale`, so it has to hold for any scale and any
+        /// `upem` (a `u16`, since it arrives as `units_per_em as i32`). The
+        /// tolerance is the `f32` rounding of the corners: four roundings, so
+        /// a relative error under 2^-21, plus one unit each for the floor and
+        /// the ceiling. Where the ideal value lies beyond an `i32` bound by
+        /// more than that, the result has to be the bound itself.
+        #[hegel::test]
+        fn extent_scaling_matches_f64_and_saturates(tc: hegel::TestCase) {
+            let upem = tc.draw(
+                generators::integers::<i32>()
+                    .min_value(0)
+                    .max_value(i32::from(u16::MAX)),
+            );
+            let scaled = tc.draw(generators::booleans());
+            let x_scale = tc.draw(generators::integers::<i32>());
+            let y_scale = tc.draw(generators::integers::<i32>());
+            let x_bearing = tc.draw(generators::integers::<i32>());
+            let y_bearing = tc.draw(generators::integers::<i32>());
+            let width = tc.draw(generators::integers::<i32>());
+            let height = tc.draw(generators::integers::<i32>());
+
+            let scale = Scale::new(scaled.then_some((x_scale, y_scale)), upem);
+            // `Scale::new` falls back to font units without a scale or with a
+            // `upem` of zero.
+            let (x_mult, y_mult) = if scaled && upem != 0 {
+                (
+                    f64::from(x_scale) / f64::from(upem),
+                    f64::from(y_scale) / f64::from(upem),
+                )
+            } else {
+                (1.0, 1.0)
+            };
+            let extents = scale.scale_extents(GlyphExtents {
+                x_bearing,
+                y_bearing,
+                width,
+                height,
+            });
+
+            let check = |what: &str, actual: i32, ideal: f64, magnitude: f64| {
+                let tolerance = 2.0 + magnitude / f64::from(1 << 21);
+                let (expected, tolerance) = if ideal > f64::from(i32::MAX) + tolerance {
+                    (f64::from(i32::MAX), 0.0)
+                } else if ideal < f64::from(i32::MIN) - tolerance {
+                    (f64::from(i32::MIN), 0.0)
+                } else {
+                    (ideal, tolerance)
+                };
+                assert!(
+                    (f64::from(actual) - expected).abs() <= tolerance,
+                    "{what}: {actual} is not within {tolerance} of {expected} \
+                     (scale {x_scale}/{y_scale} over upem {upem})"
+                );
+            };
+            let x1 = f64::from(x_bearing) * x_mult;
+            let x2 = (f64::from(x_bearing) + f64::from(width)) * x_mult;
+            let y1 = f64::from(y_bearing) * y_mult;
+            let y2 = (f64::from(y_bearing) + f64::from(height)) * y_mult;
+            check("x_bearing", extents.x_bearing, x1.floor(), x1.abs());
+            check("y_bearing", extents.y_bearing, y1.floor(), y1.abs());
+            check(
+                "width",
+                extents.width,
+                x2.ceil() - x1.floor(),
+                x1.abs() + x2.abs(),
+            );
+            check(
+                "height",
+                extents.height,
+                y2.ceil() - y1.floor(),
+                y1.abs() + y2.abs(),
+            );
+        }
+
+        /// Property: scaling an advance agrees with the same scaling done in
+        /// floating point.
+        ///
+        /// `scale_x` is `(v * ((scale << 16) / upem) + 32768) >> 16`, a fixed
+        /// point form of `v * scale / upem`; the fixed point rounding leaves
+        /// it within a unit or two of the real quotient. The value is bounded
+        /// to what reaches `scale_x` in practice — an `hmtx` advance is a
+        /// `u16`, and the fallback space widths derive from `upem` — because
+        /// wider values overflow, see
+        /// `known_failure_scaling_a_wide_value_overflows`.
+        #[hegel::test]
+        fn advance_scaling_agrees_with_floating_point(tc: hegel::TestCase) {
+            let upem = tc.draw(
+                generators::integers::<i32>()
+                    .min_value(1)
+                    .max_value(i32::from(u16::MAX)),
+            );
+            let factor = tc.draw(generators::integers::<i32>());
+            let advance = tc.draw(
+                generators::integers::<i32>()
+                    .min_value(-i32::from(u16::MAX))
+                    .max_value(i32::from(u16::MAX)),
+            );
+            let scale = Scale::new(Some((factor, factor)), upem);
+
+            let ideal = f64::from(advance) * f64::from(factor) / f64::from(upem);
+            // Above this the `i32` result truncates rather than saturating,
+            // as HarfBuzz's `hb_font_t::em_mult` does. Returning counts the
+            // case as passed, where a failed `tc.assume` would discard it and
+            // draw another.
+            if ideal.abs() >= f64::from(1 << 30) {
+                return;
+            }
+            for scaled in [scale.scale_x(advance), scale.scale_y(advance)] {
+                assert!(
+                    (f64::from(scaled) - ideal).abs() <= 2.0,
+                    "{advance} at {factor}/{upem} scaled to {scaled}, not {ideal}"
+                );
+            }
+        }
+
+        /// KNOWN FAILURE: `scale_by_mult` multiplies in `i64` without
+        /// guarding, so a value beyond the `u16` range overflows once the
+        /// scale factor is extreme.
+        ///
+        /// `mult` is `(scale << 16) / upem`, which reaches 2^47 for a `upem`
+        /// of 1, and nothing bounds the product: a debug build panics and the
+        /// workspace release profile (`overflow-checks = false`) wraps.
+        /// HarfBuzz 14.4.0 computes the same expression, unguarded, in
+        /// `hb_font_t::em_mult` (11.3.3 took an `int16_t`, which cannot
+        /// overflow it). The values that reach `scale_x` through shaping
+        /// today are `u16`-wide advances, which stay just inside `i64::MAX`
+        /// at the largest possible scale, so this is not demonstrated
+        /// through the public API.
+        ///
+        /// Un-ignore it if the multiply gets a guard, or delete it if wide
+        /// values are declared the caller's problem.
+        #[test]
+        #[ignore = "unguarded i64 multiply in Scale::scale_by_mult"]
+        fn known_failure_scaling_a_wide_value_overflows() {
+            let scale = Scale::new(Some((118_798, 0)), 1);
+            let _ = scale.scale_x(1_184_678_937);
+        }
+    }
 }
