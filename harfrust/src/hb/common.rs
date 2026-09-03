@@ -931,3 +931,320 @@ impl TagExt for Tag {
         ])
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    // `Generator` carries the combinators (`.boxed()`, `.print_as_debug()`).
+    // `PrintableGenerator` is the subset `tc.draw` accepts, because it can
+    // print what it drew into the failure report.
+    use hegel::generators::{self, Generator, PrintableGenerator};
+
+    /// The four shapes the `[..]` part of a feature spec can take, plus its
+    /// absence.
+    #[derive(Debug, Clone, Copy)]
+    enum Range {
+        None,
+        Empty,
+        Colon,
+        Start(i32),
+        StartEnd(i32, i32),
+        StartOpen(i32),
+        OpenEnd(i32),
+    }
+
+    /// The three shapes the `=..` part of a feature spec can take, plus its
+    /// absence.
+    #[derive(Debug, Clone, Copy)]
+    enum Value {
+        None,
+        Int(i32),
+        Bool(bool),
+    }
+
+    fn tag_text() -> impl PrintableGenerator<String> {
+        generators::from_regex(r"[A-Za-z0-9_]{4}")
+    }
+
+    fn draw_index(tc: &hegel::TestCase) -> i32 {
+        tc.draw(hegel::one_of!(
+            generators::integers::<i32>().min_value(0).max_value(16),
+            generators::integers::<i32>(),
+        ))
+    }
+
+    /// Property: `Feature::from_str` reads back every field of a spec string
+    /// built from the documented grammar.
+    ///
+    /// The expected tag, value and range follow the parser and
+    /// `tests_features`. The table in `Feature::from_str`'s documentation
+    /// agrees with both except for two rows, `aalt=2 -> altr .. 2` and
+    /// `aalt[3:5]=2 -> kern 3..=5 1`, which the code reads as `aalt .. 2` and
+    /// `aalt 3..=5 2`.
+    ///
+    /// `compose!` turns a closure that draws into a generator, so a
+    /// `one_of!` arm can build a `Range` from other draws. `one_of!` and
+    /// `compose!` give generators that `draw` cannot print, and
+    /// `.print_as_debug()` has the report show their value with `Debug`.
+    #[hegel::test]
+    fn feature_from_str_reads_back_a_constructed_spec(tc: hegel::TestCase) {
+        let tag = tc.draw(tag_text());
+        let sign = tc.draw(generators::sampled_from(vec!["", "+", "-"]));
+        let range = tc.draw(
+            hegel::one_of!(
+                generators::just(Range::None),
+                generators::just(Range::Empty),
+                generators::just(Range::Colon),
+                hegel::compose!(|tc| { Range::Start(draw_index(tc)) }),
+                hegel::compose!(|tc| { Range::StartEnd(draw_index(tc), draw_index(tc)) }),
+                hegel::compose!(|tc| { Range::StartOpen(draw_index(tc)) }),
+                hegel::compose!(|tc| { Range::OpenEnd(draw_index(tc)) }),
+            )
+            .print_as_debug(),
+        );
+        let value = tc.draw(
+            hegel::one_of!(
+                generators::just(Value::None),
+                hegel::compose!(|tc| { Value::Int(draw_index(tc)) }),
+                hegel::compose!(|tc| { Value::Bool(tc.draw(generators::booleans())) }),
+            )
+            .print_as_debug(),
+        );
+
+        let range_text = match range {
+            Range::None => String::new(),
+            Range::Empty => "[]".into(),
+            Range::Colon => "[:]".into(),
+            Range::Start(start) => format!("[{start}]"),
+            Range::StartEnd(start, end) => format!("[{start}:{end}]"),
+            Range::StartOpen(start) => format!("[{start}:]"),
+            Range::OpenEnd(end) => format!("[:{end}]"),
+        };
+        let value_text = match value {
+            Value::None => String::new(),
+            Value::Int(v) => format!("={v}"),
+            Value::Bool(true) => "=on".into(),
+            Value::Bool(false) => "=off".into(),
+        };
+        let spec = format!("{sign}{tag}{range_text}{value_text}");
+
+        let parsed =
+            Feature::from_str(&spec).unwrap_or_else(|e| panic!("parsing {spec:?} failed: {e}"));
+        assert_eq!(
+            parsed.tag,
+            Tag::from_bytes_lossy(tag.as_bytes()),
+            "{spec:?}"
+        );
+
+        let expected_value = match value {
+            Value::None => u32::from(sign != "-"),
+            Value::Int(v) => v as u32,
+            Value::Bool(b) => u32::from(b),
+        };
+        assert_eq!(parsed.value, expected_value, "{spec:?}");
+
+        // A bare `[n]` covers the single index n, which the parser spells as
+        // the pair (n, n + 1); the open forms use the whole range on the side
+        // they leave out. Negative indices are documented to wrap (see
+        // `parse_15` and `parse_16`).
+        let expected_range = match range {
+            Range::None | Range::Empty | Range::Colon => (0, u32::MAX),
+            Range::Start(start) => {
+                let start = start as u32;
+                if start == u32::MAX {
+                    (u32::MAX, u32::MAX)
+                } else {
+                    (start, start + 1)
+                }
+            }
+            Range::StartEnd(start, end) => (start as u32, end as u32),
+            Range::StartOpen(start) => (start as u32, u32::MAX),
+            Range::OpenEnd(end) => (0, end as u32),
+        };
+        assert_eq!((parsed.start, parsed.end), expected_range, "{spec:?}");
+    }
+
+    /// Property: `Feature::from_str` and `Feature::new` agree on ranges.
+    ///
+    /// The two build `start`/`end` independently — one from a spec string, one
+    /// from a `RangeBounds` — and `tests_features` compares them for fixed
+    /// inputs.
+    #[hegel::test]
+    fn feature_from_str_agrees_with_feature_new(tc: hegel::TestCase) {
+        let tag = tc.draw(tag_text());
+        // The spec's numbers are read as `i32`, so a spec cannot name a value
+        // or index above `i32::MAX`;
+        // `feature_from_str_reads_back_a_constructed_spec` covers the negative
+        // half of that range, which wraps.
+        let value = tc.draw(generators::integers::<u32>().max_value(i32::MAX as u32));
+        let start = tc.draw(generators::integers::<u32>().max_value(i32::MAX as u32));
+        let end = tc.draw(generators::integers::<u32>().max_value(i32::MAX as u32));
+        let spec = format!("{tag}[{start}:{end}]={value}");
+        assert_eq!(
+            Feature::from_str(&spec).unwrap(),
+            Feature::new(
+                Tag::from_bytes_lossy(tag.as_bytes()),
+                value,
+                start as usize..=end as usize
+            ),
+            "{spec:?}"
+        );
+    }
+
+    /// Property: `Variation::from_str` reads back a tag and a decimal value.
+    ///
+    /// The oracle is Rust's own `f32` parser: `TextParser::consume_f32`
+    /// accepts an optional sign, digits and one fractional part, and hands
+    /// exactly that substring to `str::parse`.
+    #[hegel::test]
+    fn variation_from_str_reads_back_a_constructed_spec(tc: hegel::TestCase) {
+        let tag = tc.draw(tag_text());
+        let sign = tc.draw(generators::sampled_from(vec!["", "-"]));
+        let number = tc.draw(generators::from_regex(r"[0-9]{1,9}(\.[0-9]{1,6})?"));
+        // The `=` is optional, but the tag is read as a greedy run of
+        // alphanumerics, so leaving it out only parses when a sign follows.
+        let separator = tc.draw(generators::sampled_from(if sign.is_empty() {
+            vec!["="]
+        } else {
+            vec!["=", ""]
+        }));
+
+        let spec = format!("{tag}{separator}{sign}{number}");
+        let parsed = Variation::from_str(&spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+        assert_eq!(
+            parsed.tag,
+            Tag::from_bytes_lossy(tag.as_bytes()),
+            "{spec:?}"
+        );
+        assert_eq!(
+            parsed.value.to_bits(),
+            format!("{sign}{number}").parse::<f32>().unwrap().to_bits(),
+            "{spec:?}"
+        );
+    }
+
+    /// Property: the `FromStr` impls in this module reject what they cannot
+    /// read rather than panicking.
+    ///
+    /// These parsers are the obvious entry point for untrusted input — a
+    /// `--features` command line, a config file — and `TextParser` walks the
+    /// string by byte index with a `debug_assert!` on its bounds.
+    #[hegel::test]
+    fn parsing_arbitrary_strings_never_panics(tc: hegel::TestCase) {
+        let s: String = tc.draw(hegel::one_of!(
+            generators::text().max_size(32).boxed(),
+            generators::from_regex(
+                r#"[+-]?['"]?[A-Za-z0-9_]{0,6}['"]?(\[[0-9:;+-]{0,8}\])?(=(-?[0-9]{0,12}(\.[0-9]{0,6})?|on|off))?"#
+            )
+            .boxed(),
+        )
+        .print_as_debug());
+        let _ = Feature::from_str(&s);
+        let _ = Variation::from_str(&s);
+        let _ = Language::from_str(&s);
+        let _ = Script::from_str(&s);
+        let _ = Direction::from_str(&s);
+    }
+
+    /// Property: `Language` lowercases ASCII and turns `_` into `-`, and
+    /// changes nothing else.
+    ///
+    /// Those are the two substitutions `Language::from_bytes` documents in its
+    /// own comment; `new_lowercases` and `new_replaces_underscore` pin one
+    /// example of each.
+    #[hegel::test]
+    fn language_lowercases_and_replaces_underscores(tc: hegel::TestCase) {
+        let text: String = tc.draw(generators::text().min_size(1).max_size(24));
+        let expected: Vec<u8> = text
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' => b.to_ascii_lowercase(),
+                b'_' => b'-',
+                _ => b,
+            })
+            .collect();
+        assert_eq!(
+            Language::new(&text).unwrap().as_bytes(),
+            expected.as_slice()
+        );
+    }
+
+    /// Property: normalizing an already-normalized language changes nothing.
+    ///
+    /// `Language::new` accepts bytes, so feeding it `as_bytes()` is how a
+    /// caller round-trips a language back through the API.
+    #[hegel::test]
+    fn language_normalization_is_idempotent(tc: hegel::TestCase) {
+        let text: String = tc.draw(generators::text().min_size(1).max_size(24));
+        let once = Language::new(&text).unwrap();
+        assert_eq!(Language::new(once.as_bytes()), Some(once));
+    }
+
+    /// Property: `Language::new` and `Language::from_str` agree.
+    ///
+    /// `new_matches_from_str` asserts this for two fixed tags.
+    #[hegel::test]
+    fn language_new_matches_from_str(tc: hegel::TestCase) {
+        let text: String = tc.draw(generators::text().max_size(24));
+        assert_eq!(Language::new(&text), Language::from_str(&text).ok());
+    }
+
+    /// Scripts whose ISO 15924 variant tag maps onto another script.
+    const SCRIPT_VARIANTS: &[&str] = &[
+        "aran", "cyrs", "geok", "hans", "hant", "jamo", "latf", "latg", "syre", "syrj", "syrn",
+    ];
+
+    /// Property: a four-letter script tag is read case-insensitively and
+    /// normalized to one capital followed by three lowercase letters.
+    ///
+    /// `Script::from_iso15924_tag` says it is "lenient, adjust case (one
+    /// capital letter followed by three small letters)", which is the form
+    /// ISO 15924 registers codes in.
+    ///
+    /// A failed `assume` discards the case and draws another.
+    #[hegel::test]
+    fn script_from_str_normalizes_the_case_of_a_letters_only_tag(tc: hegel::TestCase) {
+        let tag: String = tc.draw(generators::from_regex(r"[A-Za-z]{4}"));
+        tc.assume(!SCRIPT_VARIANTS.contains(&tag.to_ascii_lowercase().as_str()));
+
+        let mut expected = tag.to_ascii_lowercase();
+        expected[..1].make_ascii_uppercase();
+        assert_eq!(
+            Script::from_str(&tag).unwrap().tag(),
+            Tag::from_bytes_lossy(expected.as_bytes()),
+            "{tag:?}"
+        );
+    }
+
+    /// Property: a tag containing a digit is not a script.
+    ///
+    /// ISO 15924 registers four-letter codes, and
+    /// `Script::from_iso15924_tag` answers `Zzzz` for anything that does not
+    /// fit that shape.
+    #[hegel::test]
+    fn script_from_str_rejects_tags_containing_a_digit(tc: hegel::TestCase) {
+        // The digit is placed rather than filtered for, since half of all
+        // four-character alphanumeric strings have none.
+        let tag: String = tc.draw(generators::from_regex(r"[A-Za-z0-9]{4}"));
+        let at = tc.draw(generators::integers::<usize>().max_value(3));
+        let digit = tc.draw(generators::integers::<u8>().min_value(b'0').max_value(b'9'));
+        let mut tag = tag.into_bytes();
+        tag[at] = digit;
+        let tag = String::from_utf8(tag).unwrap();
+        assert_eq!(Script::from_str(&tag).unwrap(), script::UNKNOWN, "{tag:?}");
+    }
+
+    /// Property: `Direction::from_str` looks at nothing but the first byte.
+    ///
+    /// "harfbuzz also matches only the first letter", as the impl says.
+    #[hegel::test]
+    fn direction_from_str_depends_only_on_the_first_byte(tc: hegel::TestCase) {
+        let first = tc.draw(generators::characters().max_codepoint(0x7F));
+        let tail: String = tc.draw(generators::text().max_size(8));
+        let other: String = tc.draw(generators::text().max_size(8));
+        assert_eq!(
+            Direction::from_str(&format!("{first}{tail}")),
+            Direction::from_str(&format!("{first}{other}"))
+        );
+    }
+}
