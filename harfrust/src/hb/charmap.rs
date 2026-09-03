@@ -173,4 +173,57 @@ mod tests {
             Some(GlyphId::new(65))
         );
     }
+
+    /// KNOWN FAILURE: a cmap entry that resolves to glyph 0 is reported as a
+    /// hit rather than a miss.
+    ///
+    /// Every one of HarfBuzz's `CmapSubtable*::get_glyph` implementations ends
+    /// with `if (unlikely (!gid)) return false`, so "the cmap maps this
+    /// codepoint to .notdef" and "the cmap does not map this codepoint" are
+    /// the same answer there. HarfRust takes whatever `read-fonts` returns,
+    /// and `Cmap0::map_codepoint` hands back `Some(GlyphId::new(0))` for an
+    /// entry of 0. Callers that ask "does the font have this glyph" then get
+    /// the wrong answer: normalisation composes sequences the font cannot
+    /// draw, `hide_default_ignorables` keeps glyphs HarfBuzz drops, and the
+    /// Arabic fallback synthesises lookups over glyph 0.
+    ///
+    /// `unicode_to_macroman` above reaches the same place a second way: it
+    /// returns 0 for a codepoint outside Mac Roman, and that 0 is then looked
+    /// up as a codepoint.
+    ///
+    /// `TestCMAPMacTurkish.ttf` shows it through the public API. It carries
+    /// only a Mac Roman cmap, so shaping five Arabic letters gives one glyph
+    /// in HarfRust and five in HarfBuzz: every letter maps to glyph 0, and the
+    /// Arabic fallback ligates the run.
+    ///
+    /// Un-ignore it once `Charmap::map` answers `None` for an entry of 0,
+    /// whether that lands here or in `read-fonts`. Delete it if HarfRust
+    /// decides to keep the hit.
+    #[hegel::test]
+    #[ignore = "cmap hits on glyph 0 are not treated as misses"]
+    fn a_cmap_entry_of_glyph_zero_is_a_miss(tc: hegel::TestCase) {
+        let fonts: [(&str, &[u8]); 2] = [
+            (
+                "TestCMAPMacTurkish.ttf",
+                include_bytes!("../../tests/fonts/text-rendering-tests/TestCMAPMacTurkish.ttf"),
+            ),
+            (
+                "cmap0_font1.otf",
+                include_bytes!("../../tests/fonts/aots/cmap0_font1.otf"),
+            ),
+        ];
+        let (name, bytes) =
+            fonts[tc.draw_silent(hegel::generators::integers::<usize>().max_value(1))];
+        tc.note(&format!("font = {name}"));
+        let font = FontRef::new(bytes).unwrap();
+        let ranges = TableRanges::new(&font);
+        let charmap = Charmap::new(&font, &ranges);
+
+        let codepoint = tc.draw(hegel::generators::integers::<u32>().max_value(0x10_FFFF));
+        assert_ne!(
+            charmap.map(codepoint),
+            Some(GlyphId::new(0)),
+            "{name} maps U+{codepoint:04X} to .notdef"
+        );
+    }
 }
